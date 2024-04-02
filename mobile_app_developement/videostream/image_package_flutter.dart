@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:camera/camera.dart';
+
 import 'package:path_provider/path_provider.dart';
 import 'package:flutter_pdfview/flutter_pdfview.dart';
 import 'package:pdf/widgets.dart' as pw;
@@ -470,7 +471,9 @@ class _VideoStreamState extends State<VideoStream> {
 
 class CropImagePage extends StatelessWidget {
   final String imagePath;
+
   const CropImagePage({Key? key, required this.imagePath}) : super(key: key);
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -494,6 +497,7 @@ class CropImagePage extends StatelessWidget {
       ),
     );
   }
+
   Future<void> performEdgeDetection(BuildContext context, String imagePath) async {
     try {
       final edgeDetectedImage = await _detectEdges(imagePath);
@@ -515,6 +519,7 @@ class CropImagePage extends StatelessWidget {
       // Handle edge detection error
     }
   }
+
   Future<Uint8List?> _detectEdges(String imagePath) async {
     try {
       final bytes = await File(imagePath).readAsBytes();
