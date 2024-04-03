@@ -1,1 +1,351 @@
+from flask import Flask, jsonify, request, send_file
+from flask_sqlalchemy import SQLAlchemy
+from flask_cors import CORS
+import psycopg2
+from flask import send_file
+import requests
+import base64
+import os
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+from PIL import Image
+import cv2
+import numpy as np
+import imutils
+from fpdf import FPDF
 
+app = Flask(__name__)
+CORS(app)
+
+app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://postgres:postgres@localhost:5432/multistreaming'
+db = SQLAlchemy(app)
+
+class Cameraangle1(db.Model):
+    _tablename_ = "cameraangle1"
+    camera_id = db.Column(db.Integer, primary_key=True)
+    camera_url = db.Column(db.String(255), nullable=False)
+    min_angle = db.Column(db.Integer, nullable=False)
+    max_angle = db.Column(db.Integer, nullable=False)
+    view = db.Column(db.String(50), nullable=False)
+    index = db.Column(db.Integer, nullable=False)
+
+
+
+db_params = {
+    'dbname': 'multistreaming',
+    'user': 'postgres',
+    'password': 'postgres',
+    'host': 'localhost',
+    'port': '5432'
+}
+
+camera_settings = {}
+@app.route('/api/get_data', methods=['GET'])
+def get_data_from_postgres():
+   
+    try:
+        conn = psycopg2.connect(**db_params)
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM cameraangle1")
+        data = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return jsonify({'data': data})
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+@app.route('/api/fetch_and_print_data', methods=['GET'])
+def fetch_and_print_data():
+    response = requests.get('http://192.168.29.151:5001/api/get_data')  # Use the Flask app address
+    return jsonify(response.json())
+
+@app.route('/api/add_camera', methods=['POST'])
+def add_camera():
+    try:
+        data = request.json
+        new_camera = Cameraangle1(
+            camera_url=data['camera_url'],
+            min_angle=data['min_angle'],
+            max_angle=data['max_angle'],
+            view=data['view']
+        )
+        db.session.add(new_camera)
+        db.session.commit()
+        return jsonify({"message": "Camera added successfully"}), 201
+    except KeyError as e:
+        return jsonify({"error": f"Missing key in request data: {e}"}), 400
+    except Exception as e:
+        return jsonify({"error": f"Failed to add camera: {e}"}), 500
+
+# Directory to save cropped images and results
+SAVE_DIR = 'results'
+if not os.path.exists(SAVE_DIR):
+    os.makedirs(SAVE_DIR)
+
+def centroid(contour):
+    M = cv2.moments(contour)
+    cx = int(round(M['m10'] / M['m00']))
+    cy = int(round(M['m01'] / M['m00']))
+    centre = (cx, cy)
+    return centre
+
+def getScore(scoreboundaries, HoleDist):
+    score = 0
+    if scoreboundaries[0] > HoleDist:
+        score = 10
+        
+    for i in range(1, len(scoreboundaries)):
+        if scoreboundaries[i - 1] <= HoleDist < scoreboundaries[i]:
+            score = len(scoreboundaries) - i
+
+    return score
+
+@app.route('/api/save_cropped_image', methods=['POST'])
+def save_cropped_image():
+    try:
+        data = request.json
+        base64_image = data['image']
+        image_data = base64.b64decode(base64_image)
+        image_path = os.path.join(SAVE_DIR, 'cropped_image.png')
+        with open(image_path, 'wb') as f:
+            f.write(image_data)
+
+        # Create PDF with the image and scores
+        create_pdf("results/bull.png")
+
+        return jsonify({"message": "Cropped image and PDF saved successfully"}), 200
+    except KeyError as e:
+        return jsonify({"error": f"Missing key in request data: {e}"}), 400
+    except Exception as e:
+        return jsonify({"error": f"Failed to save cropped image and PDF: {e}"}), 500
+
+def create_pdf(image_path):
+    try:
+        default = cv2.imread(image_path)
+        img = cv2.resize(default, (640, 640))
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        h, s, v = cv2.split(hsv)
+        v_mask = cv2.inRange(v, 0, 155)
+        cnts = cv2.findContours(v_mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cnts = imutils.grab_contours(cnts)
+        
+        
+
+        for c in cnts:
+            if cv2.contourArea(c) > 10000:
+                cv2.drawContours(img, [c], -1, (0, 255, 0), 2)
+                area_max = cv2.contourArea(c)
+               
+
+        radius_max = np.sqrt(area_max / np.pi)
+        section_size = radius_max / 9
+        centre_v_mask = cv2.inRange(v, 215, 255)
+        cnts = cv2.findContours(centre_v_mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cnts = imutils.grab_contours(cnts)
+        
+
+        for c in cnts:
+            if cv2.contourArea(c) > 10:
+                centre_coords = centroid(c)
+        h_mask = cv2.inRange(h, 0, 30)
+        h_mask = cv2.medianBlur(h_mask, 11)
+        cnts = cv2.findContours(h_mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cnts = imutils.grab_contours(cnts)
+        holes = []
+        HoleDists = []
+       
+
+        scoreboundaries = []
+        for i in range(1, 10):
+            cv2.circle(img, centre_coords, int(i * section_size), (255, 0, 0), 1)
+            scoreboundaries.append(int(i * section_size))
+
+        scores = {'pure': {}, 'cut': {}}
+        total_shots = 0
+        total_score = 0
+      
+        for c in cnts:
+            if cv2.contourArea(c) > 1:
+                x, y, w, h = cv2.boundingRect(c)
+                pts = [(x, y), (x + w, y), (x, y + h), (x + w, y + h)]
+                centre_holes = centroid(c)
+                pts.append(centre_holes)
+                pointscore = 0
+                for pt in c:
+                    pt = pt[0]
+                    X = pt[0]
+                    Y = pt[1]
+
+                    HoleDist = np.sqrt((X - centre_coords[0]) * 2 + (Y - centre_coords[1]) * 2)
+                    HoleDists.append(HoleDist)
+                    score = getScore(scoreboundaries, HoleDist)
+                    
+
+                    if score > pointscore:
+                        pointscore = score
+                       
+                cv2.circle(img, centre_holes, 1, (0, 0, 255), -1)
+                cv2.rectangle(img, (x, y), (x + w, y + h), (0, 0, 255), 2)
+                cv2.drawContours(img, [c], -1, (0, 255, 0), 1)
+
+                cv2.putText(img, "Score: " + str(pointscore), (centre_holes[0] - 20, centre_holes[1] + 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+                if centre_holes[1] < centre_coords[1]:
+                    if pointscore in scores['pure']:
+                        scores['pure'][pointscore] += 1
+                    else:
+                        scores['pure'][pointscore] = 1
+                else:
+                    if pointscore in scores['cut']:
+                        scores['cut'][pointscore] += 1
+                    else:
+                        scores['cut'][pointscore] = 1
+                
+                total_shots += 1
+                total_score += pointscore
+
+        # Create PDF with the image and scores
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Arial", size=12)
+        pdf.cell(0, 10, "Number of Pure Shots and Cut Shots", ln=True, align='C')
+        pdf.cell(30, 10, "Number", 1, 0, 'C')
+        pdf.cell(60, 10, "Number of Pure Shots", 1, 0, 'C')
+        pdf.cell(60, 10, "Number of Cut Shots", 1, 1, 'C')
+
+        for i in range(1, 11):
+            pdf.cell(30, 10, str(i), 1, 0, 'C')
+            if i in scores['pure']:
+                pdf.cell(60, 10, str(scores['pure'][i]), 1, 0, 'C')
+            else:
+                pdf.cell(60, 10, '0', 1, 0, 'C')
+            if i in scores['cut']:
+                pdf.cell(60, 10, str(scores['cut'][i]), 1, 1, 'C')
+            else:
+                pdf.cell(60, 10, '0', 1, 1, 'C')
+        
+        pdf.cell(0, 10, "", ln=True)  # Add an empty line
+        pdf.cell(0, 10, f"Total Shots: {total_shots}", ln=True)
+        pdf.cell(0, 10, f"Total Score: {total_score}", ln=True)
+
+        pdf_path = os.path.join(SAVE_DIR, 'result.pdf')
+        pdf.output(pdf_path)
+
+    except Exception as e:
+        print(f"Failed to generate PDF: {e}")
+# API to get all camera data
+@app.route('/api/cameras', methods=['GET'])
+def get_cameras():
+    try:
+        cameras = Cameraangle1.query.all()
+        camera_data = [{'camera_id': camera.camera_id,
+                        'camera_url': camera.camera_url,
+                        'min_angle': camera.min_angle,
+                        'max_angle': camera.max_angle,
+                        'view': camera.view} for camera in cameras]
+                       
+        return jsonify({'cameras': camera_data}), 200
+    except Exception as e:
+        return jsonify({'error': 'Failed to retrieve camera data', 'details': str(e)}), 500
+
+
+# API to edit camera details
+@app.route('/api/camera/<int:camera_id>', methods=['PUT'])
+def edit_camera(camera_id):
+    try:
+        camera = Cameraangle1.query.get(camera_id)
+        if not camera:
+            return jsonify({'error': 'Camera not found'}), 404
+
+        data = request.json
+        camera.camera_url = data.get('camera_url', camera.camera_url)
+        camera.min_angle = data.get('min_angle', camera.min_angle)
+        camera.max_angle = data.get('max_angle', camera.max_angle)
+        camera.view = data.get('view', camera.view)
+
+        db.session.commit()
+        return jsonify({'message': 'Camera details updated successfully'}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/delete_camera_url/<int:camera_id>', methods=['DELETE'])
+def delete_camera_url(camera_id):
+    if request.method == 'DELETE':
+        try:
+            camera = Cameraangle1.query.filter_by(camera_id=camera_id).first()
+
+            if camera is None:
+                return jsonify({'error': 'Camera not found'}), 404
+
+            db.session.delete(camera)
+
+            db.session.commit()
+
+            return jsonify({'message': f'Camera URL deleted successfully for camera ID {camera_id}'}), 200
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+        
+def generate_pdf(image_path):
+    try:
+        pdf_path = os.path.join(SAVE_DIR, 'cropped_image.pdf')
+        c = canvas.Canvas(pdf_path, pagesize=letter)
+        c.drawImage(image_path, 100, 100, width=400, height=400)
+        c.save()
+    except Exception as e:
+        print(f"Failed to generate PDF: {e}")
+
+@app.route('/api/download_pdf', methods=['GET'])
+def download_pdf():
+    try:
+        pdf_path = os.path.join(SAVE_DIR, 'result.pdf')
+        print("@@@@@",pdf_path)
+        return send_file(pdf_path, as_attachment=False)
+    except Exception as e:
+        return jsonify({"error": f"Failed to download PDF: {e}"}), 5004
+
+@app.route('/api/save_camera_settings', methods=['POST'])
+def save_camera_settings():
+    try:
+        data = request.json
+        
+        # Extract data from the request payload
+        camera_url = data.get('camera_url')
+        min_angle = data.get('min_angle')
+        max_angle = data.get('max_angle')
+        view = data.get('view')
+        index = data.get('index')
+       
+      
+        existing_view = Cameraangle1.query.filter_by(view=view).first()
+        if existing_view:
+            return jsonify({"error": "View already exists"}), 400
+        
+        
+        existing_camera = Cameraangle1.query.filter_by(camera_url=camera_url).first()
+        if existing_camera:
+            return jsonify({"error": "Camera URL already exists"}), 400
+        
+        # Create a new camera angle record
+        new_camera = Cameraangle1(
+            camera_url=camera_url,
+            min_angle=min_angle,
+            max_angle=max_angle,
+            view=view,
+            index=index,
+            )
+        db.session.add(new_camera)
+        db.session.commit()
+        
+        return jsonify({"message": "Camera settings saved successfully"}), 201
+    
+    except KeyError as e:
+        return jsonify({"error": f"Missing key in request data: {e}"}), 400
+    
+    except Exception as e:
+        return jsonify({"error": f"Failed to save camera settings: {e}"}), 500
+
+
+
+if __name__ == "__main__":
+    app.run(host="192.168.29.151", port=5001)
